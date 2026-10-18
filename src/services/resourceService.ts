@@ -6,6 +6,7 @@ import { hashFileResource, hashLinkResource } from "../utils/crypto.js";
 import { createTtlCache } from "../lib/ttlCache.js";
 import { config } from "../config.js";
 import { emitToPublisher } from "./webhookService.js";
+import { enqueueStorageCleanup, enqueueThumbnailJob } from "./workerQueue.js";
 
 // Short-lived cache for catalog/preview reads (issue #115). These endpoints are
 // hit far more often than resources change, so a small TTL cuts repeated DB
@@ -79,34 +80,50 @@ export async function createFileResource(data: {
     })
     .returning();
 
-  const storagePath = await uploadFile(resource.id, data.fileBuffer, data.filename, data.mimeType);
-
-  let thumbnailPath: string | undefined;
-  if (data.mimeType.startsWith("image/")) {
+  // Upload the file; if it fails, compensate by deleting the just-inserted row
+  // so a failed upload leaves no orphan resource behind (issue #88).
+  let storagePath: string;
+  try {
+    storagePath = await uploadFile(resource.id, data.fileBuffer, data.filename, data.mimeType);
+  } catch (err) {
     try {
-      const sharp = (await import("sharp")).default;
-      const thumbBuffer = await sharp(data.fileBuffer)
-        .resize(400, 400, { fit: "inside", withoutEnlargement: true })
-        .jpeg({ quality: 80 })
-        .toBuffer();
-      thumbnailPath = await uploadFile(
-        resource.id,
-        thumbBuffer,
-        `thumb_${data.filename.replace(/\.[^.]+$/, "")}.jpg`,
-        "image/jpeg",
+      await db.delete(resources).where(eq(resources.id, resource.id));
+    } catch (cleanupErr) {
+      const { getLogger } = await import("../lib/logger.js");
+      getLogger().error(
+        { event: "upload_rollback_failed", resourceId: resource.id, err: cleanupErr },
+        "failed to remove resource row after upload failure",
       );
-    } catch {
-      // Thumbnail generation is non-blocking; the original upload already succeeded.
     }
+    throw err;
   }
 
   const [updated] = await db
     .update(resources)
-    .set({ storagePath, ...(thumbnailPath !== undefined && { thumbnailPath }) })
+    .set({ storagePath })
     .where(eq(resources.id, resource.id))
     .returning();
 
   invalidateReads(updated.id);
+
+  // Thumbnail generation is deferred to a worker so the publish request never
+  // blocks on `sharp` (issue #89). The worker enforces the pixel limit.
+  if (data.mimeType.startsWith("image/")) {
+    try {
+      await enqueueThumbnailJob({
+        resourceId: resource.id,
+        fileBuffer: data.fileBuffer,
+        filename: data.filename,
+      });
+    } catch (err) {
+      const { getLogger } = await import("../lib/logger.js");
+      getLogger().error(
+        { event: "thumbnail_enqueue_failed", resourceId: resource.id, err },
+        "failed to enqueue thumbnail generation job",
+      );
+    }
+  }
+
   return updated;
 }
 
@@ -168,26 +185,48 @@ export type CatalogPage<T> = {
 
 const CATALOG_DEFAULT_LIMIT = 20;
 
-function sortRows<T extends { price: string; title: string; createdAt: Date | string }>(
-  rows: T[],
-  sort: CatalogSort,
-): T[] {
-  // "newest" is the default — handled by ORDER BY created_at DESC in queryCatalog (#287).
+// Locale-independent title comparison (#108). `localeCompare` without an
+// explicit locale depends on the host's ICU/locale, so the same catalog could
+// order differently across machines. Comparing lowercased strings with
+// `<`/`>` uses code-unit order, which is stable everywhere.
+function compareTitles(a: string, b: string): number {
+  const la = a.toLowerCase();
+  const lb = b.toLowerCase();
+  if (la < lb) return -1;
+  if (la > lb) return 1;
+  return 0;
+}
+
+function sortRows<
+  T extends { id: string; price: string; title: string; createdAt: Date | string },
+>(rows: T[], sort: CatalogSort): T[] {
+  // "newest" is the default — handled by ORDER BY created_at DESC, id DESC in
+  // queryCatalog (#287, #108).
   if (sort === "newest" || !sort) return rows;
 
   const sorted = [...rows];
   switch (sort) {
     case "price_asc":
-      sorted.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+      sorted.sort((a, b) => parseFloat(a.price) - parseFloat(b.price) || compareIds(a.id, b.id));
       break;
     case "price_desc":
-      sorted.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+      sorted.sort((a, b) => parseFloat(b.price) - parseFloat(a.price) || compareIds(a.id, b.id));
       break;
     case "title":
-      sorted.sort((a, b) => a.title.localeCompare(b.title));
+      // Deterministic title order with an id tiebreaker so equal titles never
+      // straddle page boundaries (#108).
+      sorted.sort((a, b) => compareTitles(a.title, b.title) || compareIds(a.id, b.id));
       break;
   }
   return sorted;
+}
+
+// Stable id tiebreaker: descending id order, matching the catalog's
+// `created_at DESC, id DESC` ordering.
+function compareIds(a: string, b: string): number {
+  if (a < b) return 1;
+  if (a > b) return -1;
+  return 0;
 }
 
 async function queryCatalog() {
@@ -208,7 +247,9 @@ async function queryCatalog() {
     .from(resources)
     .innerJoin(publishers, eq(resources.publisherId, publishers.id))
     .where(eq(resources.listed, true))
-    .orderBy(desc(resources.createdAt));
+    // `id DESC` is a stable tiebreaker so rows sharing a `created_at` have a
+    // total order and pagination never duplicates or skips them (#108).
+    .orderBy(desc(resources.createdAt), desc(resources.id));
 }
 
 async function getCachedCatalogRows(): Promise<Awaited<ReturnType<typeof queryCatalog>>> {
@@ -417,12 +458,33 @@ export async function delistResource(
     title: resource.title,
   });
 
-  if (resource.storagePath) {
-    await deleteFile(resource.storagePath);
-  }
-
-  if (resource.thumbnailPath) {
-    await deleteFile(resource.thumbnailPath);
+  // Storage cleanup is best-effort: the DB delist already stands, so a failed
+  // delete must not surface as an error to the caller (issue #87). Log the
+  // failure and queue a retry so the orphaned object is removed later.
+  for (const path of [resource.storagePath, resource.thumbnailPath]) {
+    if (!path) continue;
+    try {
+      await deleteFile(path);
+    } catch (err) {
+      const { getLogger } = await import("../lib/logger.js");
+      getLogger().error(
+        {
+          event: "delist_storage_cleanup_failed",
+          resourceId: resource.id,
+          storagePath: path,
+          err,
+        },
+        "failed to delete stored file during delist; queued for retry",
+      );
+      try {
+        await enqueueStorageCleanup({ resourceId: resource.id, storagePath: path });
+      } catch (queueErr) {
+        getLogger().error(
+          { event: "delist_storage_cleanup_enqueue_failed", resourceId: resource.id, storagePath: path, err: queueErr },
+          "failed to enqueue storage cleanup retry",
+        );
+      }
+    }
   }
 
   // Only registered resources exist on-chain; anything else delists DB-only.

@@ -1,12 +1,12 @@
 /**
- * Reconciliation script for MindVault.
+ * Reconciliation script for SynapsVault.
  *
  * Walks every resource in the database that is marked as `onchain_status =
  * "registered"`, fetches the matching entry from the vault-registry contract on
  * Stellar, and reports any discrepancies between the two. The script is
  * read-only — it does not modify the database or the contract.
  *
- * Run via `pnpm reconcile` (from `server/`) or `pnpm tsx scripts/reconcile.ts`.
+ * Run via `npm run reconcile` (from `server/`) or `npx tsx scripts/reconcile.ts`.
  *
  * Exit codes:
  *   0 — all checked resources are in sync
@@ -100,7 +100,7 @@ export function printSummary(summary: ReconciliationSummary): 0 | 1 {
 
   const out: string[] = [];
   out.push(line);
-  out.push("MindVault Reconciliation Summary");
+  out.push("SynapsVault Reconciliation Summary");
   out.push(`Run at: ${summary.checkedAt}`);
   out.push(`Resources checked:      ${summary.totalChecked}`);
   out.push(`In sync:                ${summary.inSync}`);

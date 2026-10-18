@@ -62,3 +62,17 @@ export class CircuitBreaker {
 
   getState(): State { return this.state; }
 }
+
+/**
+ * Shared breaker for outbound Soroban/Stellar RPC calls. Kept as a module-level
+ * singleton so that failures observed by one request trip the breaker for all.
+ */
+export const sorobanCircuitBreaker = new CircuitBreaker("soroban-rpc");
+
+/**
+ * Run an outbound Soroban RPC call through the shared circuit breaker.
+ * Use this for every call that talks to the Stellar/Soroban RPC endpoint.
+ */
+export function callSorobanRpc<T>(fn: () => Promise<T>): Promise<T> {
+  return sorobanCircuitBreaker.call(fn);
+}

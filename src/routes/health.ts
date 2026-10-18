@@ -1,5 +1,5 @@
 import { Router, type Router as RouterType } from "express";
-import { probeDatabase, probeSorobanRpc } from "../lib/probes.js";
+import { getCachedProbes } from "../lib/probes.js";
 import { overallReadinessStatus } from "../lib/readiness.js";
 import { isAccepting } from "../lib/lifecycle.js";
 import { pgClient } from "../db/client.js";
@@ -30,12 +30,7 @@ router.get("/health/ready", async (_req, res) => {
     return;
   }
 
-  const [database, sorobanRpc] = await Promise.all([
-    probeDatabase(),
-    probeSorobanRpc(),
-  ]);
-
-  const checks = { database, sorobanRpc };
+  const checks = await getCachedProbes();
   const status = overallReadinessStatus(checks);
   const statusCode = status === "ok" ? 200 : 503;
 

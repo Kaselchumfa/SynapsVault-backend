@@ -1,4 +1,10 @@
-import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
+import {
+  Keypair,
+  TransactionBuilder,
+  xdr,
+  Address,
+  scValToNative,
+} from "@stellar/stellar-sdk";
 import {
   Client,
   Errors,
@@ -10,6 +16,144 @@ import { config } from "../config.js";
 import { getLogger } from "../lib/logger.js";
 
 const NETWORK_PASSPHRASE = networkPassphraseForX402(config.NETWORK);
+
+/**
+ * Thrown when a signed XDR does not match the operation the caller expects.
+ * Callers should reject the request before broadcasting.
+ */
+export class SignedTxValidationError extends Error {
+  readonly code = "VALIDATION_ERROR";
+  constructor(message: string) {
+    super(message);
+    this.name = "SignedTxValidationError";
+  }
+}
+
+export type ExpectedSignedTx = {
+  /** Contract id the transaction must invoke. Defaults to the registry contract. */
+  contractId?: string;
+  /** Contract function name that must be invoked. */
+  functionName: "register" | "set_price" | "transfer_ownership";
+  /** Resource id that must be the first argument of the invocation. */
+  resourceId: string;
+  /** Stellar account (G...) that must be the transaction source. */
+  owner: string;
+};
+
+/**
+ * Decode a signed transaction envelope and assert it invokes exactly the
+ * expected registry contract, function, resource id, and source account.
+ * Throws SignedTxValidationError on any mismatch.
+ */
+export function validateSignedTx(signedXdr: string, expected: ExpectedSignedTx): void {
+  const expectedContractId = expected.contractId ?? config.REGISTRY_CONTRACT_ID;
+
+  let tx: ReturnType<typeof TransactionBuilder.fromXDR>;
+  try {
+    tx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+  } catch (err) {
+    throw new SignedTxValidationError(
+      `Malformed signed transaction: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Source account must be the resource owner.
+  const source = tx.source;
+  if (source !== expected.owner) {
+    throw new SignedTxValidationError(
+      `Transaction source account ${source} does not match resource owner ${expected.owner}`,
+    );
+  }
+
+  // Must contain exactly one operation.
+  const operations = tx.operations;
+  if (operations.length !== 1) {
+    throw new SignedTxValidationError(
+      `Expected exactly one operation, found ${operations.length}`,
+    );
+  }
+
+  const op = operations[0];
+  if (op.type !== "invokeHostFunction") {
+    throw new SignedTxValidationError(
+      `Expected invokeHostFunction operation, found ${op.type}`,
+    );
+  }
+
+  const hostFn = (op as any).func as xdr.HostFunction;
+  if (!hostFn || hostFn.switch().name !== "hostFunctionTypeInvokeContract") {
+    throw new SignedTxValidationError("Expected an invokeContract host function");
+  }
+
+  const invokeContract = hostFn.invokeContract();
+  const contractAddress = Address.fromScAddress(invokeContract.contractAddress()).toString();
+  if (contractAddress !== expectedContractId) {
+    throw new SignedTxValidationError(
+      `Transaction targets contract ${contractAddress}, expected ${expectedContractId}`,
+    );
+  }
+
+  const functionName = invokeContract.functionName().toString();
+  if (functionName !== expected.functionName) {
+    throw new SignedTxValidationError(
+      `Transaction invokes function ${functionName}, expected ${expected.functionName}`,
+    );
+  }
+
+  const args = invokeContract.args();
+  if (args.length < 1) {
+    throw new SignedTxValidationError("Transaction invocation has no arguments");
+  }
+
+  const resourceIdArg = scValToNative(args[0]);
+  if (String(resourceIdArg) !== expected.resourceId) {
+    throw new SignedTxValidationError(
+      `Transaction resource id ${String(resourceIdArg)} does not match expected ${expected.resourceId}`,
+    );
+  }
+}
+
+export type TransactionStatus = "SUCCESS" | "FAILED" | "PENDING";
+
+/**
+ * Poll Soroban RPC getTransaction until the transaction reaches a terminal
+ * state or the attempt budget is exhausted. Returns PENDING on timeout.
+ */
+export async function pollTransactionStatus(
+  txHash: string,
+  opts: { maxAttempts: number; intervalMs: number },
+): Promise<{ status: TransactionStatus; txHash: string }> {
+  const server = registryClient.options.rpcUrl;
+
+  for (let attempt = 0; attempt < opts.maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, opts.intervalMs));
+
+    const statusResponse = await fetch(server, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getTransaction",
+        params: { hash: txHash },
+      }),
+    });
+
+    const statusResult = await statusResponse.json();
+
+    if (statusResult.error) {
+      // Transaction not found yet, continue polling.
+      continue;
+    }
+
+    const status = statusResult.result?.status;
+    if (status === "SUCCESS") return { status: "SUCCESS", txHash };
+    if (status === "FAILED") return { status: "FAILED", txHash };
+    // NOT_FOUND / PENDING: continue polling.
+  }
+
+  return { status: "PENDING", txHash };
+}
 
 const keypair = Keypair.fromSecret(config.REGISTRY_SECRET_KEY);
 
@@ -158,20 +302,28 @@ export async function delistOnChain(id: string): Promise<{
   }
 }
 
-/**
- * Submit a creator-signed XDR to Soroban RPC and poll for the result.
- * Returns the transaction hash and success/failure status.
- */
-export async function submitSignedTx(signedXdr: string): Promise<{
-  txHash: string;
-  success: boolean;
-  error?: string;
-}> {
-  try {
-    // Validate the signed transaction parses before submission
-    TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+export type SubmitSignedTxResult =
+  | { state: "confirmed"; txHash: string }
+  | { state: "failed"; txHash: string; error: string }
+  | { state: "pending"; txHash: string };
 
-    // Submit to Soroban RPC
+/**
+ * Validate, submit, and (briefly) poll a creator-signed XDR.
+ *
+ * Validation runs first and throws SignedTxValidationError on any mismatch so
+ * the caller can reject before broadcasting. Submission errors return
+ * `{ state: 'failed' }`. A timeout returns `{ state: 'pending' }` — the
+ * transaction may still confirm, so the worker resolves it by hash later.
+ */
+export async function submitSignedTx(
+  signedXdr: string,
+  expected: ExpectedSignedTx,
+  opts: { maxAttempts?: number; intervalMs?: number } = {},
+): Promise<SubmitSignedTxResult> {
+  // Validate before broadcasting; throws SignedTxValidationError on mismatch.
+  validateSignedTx(signedXdr, expected);
+
+  try {
     const server = registryClient.options.rpcUrl;
     const response = await fetch(server, {
       method: "POST",
@@ -191,100 +343,55 @@ export async function submitSignedTx(signedXdr: string): Promise<{
     const result = await response.json();
 
     if (result.error) {
+      const message = result.error.message || "Transaction submission failed";
       getLogger().warn(
-        {
-          event: "onchain_submit",
-          phase: "send",
-          success: false,
-          error: result.error.message || "Transaction submission failed",
-        },
+        { event: "onchain_submit", phase: "send", success: false, error: message },
         "signed transaction submission failed",
       );
-      return {
-        txHash: "",
-        success: false,
-        error: result.error.message || "Transaction submission failed",
-      };
+      return { state: "failed", txHash: "", error: message };
     }
 
-    const txHash = result.result.hash;
+    const txHash: string = result.result.hash;
     getLogger().info(
       { event: "onchain_submit", phase: "sent", txHash },
       "signed transaction submitted",
     );
 
-    // Poll for transaction result with timeout
-    const maxAttempts = 30; // 30 seconds timeout
-    const pollInterval = 1000; // 1 second
+    const { status } = await pollTransactionStatus(txHash, {
+      maxAttempts: opts.maxAttempts ?? 3,
+      intervalMs: opts.intervalMs ?? 1000,
+    });
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-
-      const statusResponse = await fetch(server, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getTransaction",
-          params: {
-            hash: txHash,
-          },
-        }),
-      });
-
-      const statusResult = await statusResponse.json();
-
-      if (statusResult.error) {
-        // Transaction not found yet, continue polling
-        continue;
-      }
-
-      const status = statusResult.result.status;
-
-      if (status === "SUCCESS") {
-        getLogger().info(
-          { event: "onchain_submit", phase: "confirmed", txHash, success: true },
-          "signed transaction confirmed on-chain",
-        );
-        return {
-          txHash,
-          success: true,
-        };
-      } else if (status === "FAILED") {
-        getLogger().warn(
-          { event: "onchain_submit", phase: "confirmed", txHash, success: false },
-          "signed transaction failed on-chain",
-        );
-        return {
-          txHash,
-          success: false,
-          error: "Transaction failed on-chain",
-        };
-      }
-      // If status is still PENDING, continue polling
+    if (status === "SUCCESS") {
+      getLogger().info(
+        { event: "onchain_submit", phase: "confirmed", txHash, success: true },
+        "signed transaction confirmed on-chain",
+      );
+      return { state: "confirmed", txHash };
     }
 
-    // Timeout reached
+    if (status === "FAILED") {
+      getLogger().warn(
+        { event: "onchain_submit", phase: "confirmed", txHash, success: false },
+        "signed transaction failed on-chain",
+      );
+      return { state: "failed", txHash, error: "Transaction failed on-chain" };
+    }
+
+    // PENDING: the transaction may still confirm; let the worker resolve it.
     getLogger().warn(
-      { event: "onchain_submit", phase: "timeout", txHash, success: false },
-      "signed transaction confirmation timed out",
+      { event: "onchain_submit", phase: "pending", txHash },
+      "signed transaction still pending after poll window",
     );
-    return {
-      txHash,
-      success: false,
-      error: "Transaction polling timeout - status unknown",
-    };
+    return { state: "pending", txHash };
   } catch (error) {
     getLogger().error(
       { event: "onchain_submit", phase: "error", err: error },
       "signed transaction submit failed",
     );
     return {
+      state: "failed",
       txHash: "",
-      success: false,
       error: error instanceof Error ? error.message : "Unknown error occurred",
     };
   }

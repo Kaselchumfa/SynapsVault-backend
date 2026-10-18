@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { corsMiddleware } from "./cors.js";
 import { securityHeaders } from "./middleware/security.js";
 import { requestContextMiddleware } from "./middleware/requestContext.js";
+import { auditLogMiddleware } from "./middleware/auditLog.js";
 import { inFlightMiddleware } from "./middleware/inFlight.js";
 import { requestTimeout } from "./middleware/timeout.js";
 import { requestDurationMiddleware } from "./middleware/requestDuration.js";
@@ -29,6 +30,7 @@ export function createApp(): Express {
   app.use(compression());
   app.use(corsMiddleware());
   app.use(requestContextMiddleware);
+  app.use(auditLogMiddleware);
   app.use(inFlightMiddleware);
   app.use(
     express.json({

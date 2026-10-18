@@ -5,8 +5,8 @@
  * publisher (identified by the fixed seed email).
  *
  * Usage:
- *   pnpm seed                  # DB only
- *   pnpm seed --onchain        # DB + register each resource on Stellar testnet
+ *   npm run seed                  # DB only
+ *   npm run seed -- --onchain     # DB + register each resource on Stellar testnet
  */
 
 import { eq } from "drizzle-orm";
@@ -18,7 +18,7 @@ import { contract } from "@stellar/stellar-sdk";
 import { NETWORK_PASSPHRASE, registryClient, registryKeypair } from "../src/services/registryClient.js";
 import { config } from "../src/config.js";
 
-const SEED_EMAIL = "seed-dev@mindvault.local";
+const SEED_EMAIL = "seed-dev@synapsvault.local";
 
 const SAMPLE_RESOURCES = [
   {
@@ -66,7 +66,7 @@ async function getOrCreateSeedPublisher() {
   }
 
   const { publisher } = await registerPublisher({
-    name: "MindVault Seed",
+    name: "SynapsVault Seed",
     email: SEED_EMAIL,
     walletAddress: config.PAY_TO,
   });
@@ -151,7 +151,7 @@ async function registerOnChain(resource: {
 async function main() {
   const onchain = process.argv.includes("--onchain");
 
-  console.log("Seeding MindVault catalog...");
+  console.log("Seeding SynapsVault catalog...");
   if (onchain) console.log("  (--onchain: will register on Stellar testnet)");
 
   const publisher = await getOrCreateSeedPublisher();

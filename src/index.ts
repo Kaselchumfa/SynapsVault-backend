@@ -19,6 +19,86 @@ initSentry();
 
 const app = createApp();
 
+// Advisory lock key used to elect a single leader across replicas. Only the
+// instance holding this lock runs the background workers, so scaling out does
+// not duplicate RPC load or let replicas write the same rows concurrently.
+const WORKER_LEADER_LOCK_ID = 0x53594e41; // "SYNA"
+
+let workersStarted = false;
+let leaderLockHeld = false;
+
+/**
+ * Try to become the worker leader by acquiring a session-level Postgres
+ * advisory lock on a dedicated connection. The lock is held for the process
+ * lifetime and released during graceful shutdown.
+ *
+ * Returns true when this instance acquired the lock and should run workers.
+ */
+async function tryAcquireWorkerLeaderLock(): Promise<boolean> {
+  try {
+    const client = await pgClient.connect();
+    const result = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock($1) AS locked",
+      [WORKER_LEADER_LOCK_ID],
+    );
+    const locked = result.rows[0]?.locked === true;
+    if (locked) {
+      leaderLockHeld = true;
+      // Keep the connection open for the process lifetime so the session-level
+      // lock stays held. Release it explicitly on shutdown.
+      client.on("error", (err) => {
+        rootLogger.error({ event: "worker_leader_lock_error", err }, "worker leader lock connection error");
+      });
+      return true;
+    }
+    // Not the leader: return the connection to the pool.
+    client.release();
+    return false;
+  } catch (err) {
+    rootLogger.error({ event: "worker_leader_lock_error", err }, "failed to acquire worker leader lock");
+    return false;
+  }
+}
+
+async function releaseWorkerLeaderLock(): Promise<void> {
+  if (!leaderLockHeld) return;
+  leaderLockHeld = false;
+  try {
+    const client = await pgClient.connect();
+    try {
+      await client.query("SELECT pg_advisory_unlock($1)", [WORKER_LEADER_LOCK_ID]);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    rootLogger.error({ event: "worker_leader_unlock_error", err }, "failed to release worker leader lock");
+  }
+}
+
+async function startWorkersIfLeader(): Promise<void> {
+  if (!config.WORKERS_ENABLED) {
+    rootLogger.info(
+      { event: "workers_disabled" },
+      "WORKERS_ENABLED is false; skipping background workers",
+    );
+    return;
+  }
+
+  const isLeader = await tryAcquireWorkerLeaderLock();
+  if (!isLeader) {
+    rootLogger.info(
+      { event: "workers_skipped_not_leader" },
+      "another instance holds the worker leader lock; skipping background workers",
+    );
+    return;
+  }
+
+  workersStarted = true;
+  rootLogger.info({ event: "workers_started_as_leader" }, "acquired worker leader lock; starting background workers");
+  startRetryPendingWorker();
+  startEventListener();
+}
+
 const server: Server = app.listen(config.PORT, () => {
   rootLogger.info(
     {
@@ -30,9 +110,8 @@ const server: Server = app.listen(config.PORT, () => {
     "SynapsVault server started",
   );
 
-  startRetryPendingWorker();
-  startEventListener();
   startPoolMetrics();
+  void startWorkersIfLeader();
 });
 
 let shuttingDown = false;
@@ -41,8 +120,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  stopRetryPendingWorker();
-  stopEventListener();
+  if (workersStarted) {
+    stopRetryPendingWorker();
+    stopEventListener();
+  }
   stopPoolMetrics();
 
   // Stop passing readiness checks so load balancers drain us before we close.
@@ -77,6 +158,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   try {
     await closeRateLimitStore();
+    await releaseWorkerLeaderLock();
     await pgClient.end({ timeout: 5 });
     const forced = timedOut && inFlightCount() > 0;
     rootLogger.info({ event: "shutdown_complete", signal, forced }, "graceful shutdown complete");

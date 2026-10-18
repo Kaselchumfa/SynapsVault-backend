@@ -14,6 +14,9 @@ services:
       PORT: 3000
       DATABASE_URL: postgresql://synapse:synapse@postgres:5432/synapsvault
       NODE_ENV: ${NODE_ENV:-development}
+      # The ledger checkpoint is stored in Postgres; this file path is only
+      # used as a fallback when the database is unavailable.
+      LEDGER_TRACKER_PATH: /app/data/last-processed-ledger.json
 
     depends_on:
       postgres:
@@ -27,6 +30,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+    volumes:
+      # Persist the file-based ledger checkpoint fallback across container
+      # recreation. The primary checkpoint lives in Postgres.
+      - ledger_data:/app/data
 
     networks:
       - synapsvault
@@ -61,6 +69,8 @@ services:
 
 volumes:
   postgres_data:
+    driver: local
+  ledger_data:
     driver: local
 
 networks:

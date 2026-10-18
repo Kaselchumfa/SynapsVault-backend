@@ -252,8 +252,19 @@ const envSchema = z.object({
   // Optional Redis URL for a shared sliding-window rate-limit store (multi-instance).
   REDIS_URL: z.string().url().optional(),
 
+  // Background workers (event listener + retry worker). When multiple replicas
+  // run, only one should execute them: either set WORKERS_ENABLED=false on all
+  // but one instance, or leave it true everywhere and let the Postgres advisory
+  // lock (WORKER_LEADER_LOCK_ID) elect a single leader.
+  WORKERS_ENABLED: envFlag(true),
+  // Advisory lock key used to elect the single worker leader across replicas.
+  WORKER_LEADER_LOCK_ID: z.coerce.number().int().default(4_021_001),
+
   // Optional HMAC-SHA256 request signatures for publisher mutations (off by default).
   REQUIRE_REQUEST_SIGNATURE: envFlag(false),
+  // Legacy register flow where the server signs with the platform registry key
+  // on the creator's behalf (#80). Off by default; clients must send signedXdr.
+  ALLOW_LEGACY_REGISTER: envFlag(false),
   // Max clock skew for X-Timestamp when signatures are required (default 5 minutes).
   SIGNATURE_MAX_SKEW_MS: z.coerce.number().default(300_000),
 

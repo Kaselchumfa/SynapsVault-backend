@@ -87,6 +87,19 @@ export function detectContentType(buffer: Buffer): string | null {
   return null;
 }
 
+/**
+ * Maximum number of pixels `sharp` will decode for a single image (#89).
+ * Images above this are rejected before any resize work happens, bounding the
+ * CPU an attacker can force with a crafted "decompression bomb".
+ */
+export const MAX_THUMBNAIL_PIXELS = 25_000_000;
+
+/**
+ * Maximum number of uploads processed concurrently (#90). Bounds peak memory
+ * when several large uploads arrive at once.
+ */
+export const UPLOAD_CONCURRENCY = 4;
+
 export type UploadValidationResult =
   | { ok: true; contentType: string }
   | { ok: false; status: 415; error: string };

@@ -1,4 +1,5 @@
 import { Router, type Router as RouterType } from "express";
+import { promises as fs } from "node:fs";
 import { apiKeyAuth } from "../middleware/apiKeyAuth.js";
 import { requestSignatureAuth } from "../middleware/requestSignatureAuth.js";
 import { singleFileUpload, validateUploadContentType } from "../middleware/uploadGuards.js";
@@ -25,10 +26,10 @@ import {
   delistResource,
   getResourceById,
 } from "../services/resourceService.js";
-import { downloadFile } from "../storage/supabaseStorage.js";
+import { downloadFile, StorageObjectNotFoundError } from "../storage/supabaseStorage.js";
 import { db } from "../db/client.js";
 import { payments, resources } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { config } from "../config.js";
 import { getLogger } from "../lib/logger.js";
 import { publishIpRateLimit, publishWalletRateLimit } from "../middleware/rateLimiters.js";
@@ -36,18 +37,35 @@ import { getIdempotencyStore, idempotencyCacheKey } from "../lib/idempotency.js"
 import { buildRegistrationFailureGuidance, explorerTxUrl } from "../lib/registrationGuidance.js";
 import {
   NETWORK_PASSPHRASE,
+  REGISTRY_CONTRACT_ID,
   registryClient,
   registryKeypair,
   setPrice,
   transferOwnership,
   buildRegisterTx,
   submitSignedTx,
+  validateSignedTx,
 } from "../services/registryClient.js";
 import { parsePayerFromXPayment } from "../lib/parseXPayment.js";
-import { AppError } from "../lib/errors.js";
+import { AppError, isAppError } from "../lib/errors.js";
 import { emitToPublisher } from "../services/webhookService.js";
 
 const router: RouterType = Router();
+
+// Best-effort removal of a multer disk-stored temp file. Never throws.
+async function cleanupTempFile(path: string | undefined): Promise<void> {
+  if (!path) return;
+  try {
+    await fs.unlink(path);
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      getLogger().warn(
+        { event: "upload_temp_cleanup_error", path, err },
+        "failed to remove upload temp file",
+      );
+    }
+  }
+}
 
 // POST /resources — publish a resource (authenticated)
 router.post(
@@ -102,13 +120,18 @@ router.post(
 
         const { title, description, price, walletAddress } = parsed.data;
 
+        // Uploads are streamed to disk by multer (#90); read the temp file
+        // back into a buffer for storage. Thumbnail generation now happens
+        // asynchronously in a worker (#89), so the response does not wait on it.
+        const fileBuffer = await fs.readFile(req.file.path);
+
         const resource = await createFileResource({
           publisherId: publisher.id,
           title,
           description,
           price,
           walletAddress: walletAddress || publisher.walletAddress,
-          fileBuffer: req.file.buffer,
+          fileBuffer,
           filename: req.file.originalname,
           mimeType: req.file.mimetype,
         });
@@ -147,6 +170,10 @@ router.post(
       // being stuck behind a stale in-progress marker.
       if (scopedKey) store.delete(scopedKey);
       throw err;
+    } finally {
+      // Always remove the disk-stored temp file, whether the request succeeded
+      // or failed.
+      await cleanupTempFile(req.file?.path);
     }
   },
 );
@@ -245,7 +272,19 @@ router.get("/resources/:id/thumbnail", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=31536000");
     res.send(buffer);
   } catch (err) {
-    throw new AppError("NOT_FOUND", "Thumbnail not found");
+    // Only a genuinely missing object is a 404. Any other storage failure is an
+    // outage and must surface as 503 so clients and monitoring can tell the
+    // difference (#91).
+    if (err instanceof StorageObjectNotFoundError) {
+      throw new AppError("NOT_FOUND", "Thumbnail not found");
+    }
+    getLogger().error(
+      { err, event: "thumbnail_storage_error", resourceId: resource.id },
+      "thumbnail storage download failed",
+    );
+    throw new AppError("STORAGE_UNAVAILABLE", "Thumbnail storage is temporarily unavailable", undefined, {
+      cause: err,
+    });
   }
 });
 
@@ -469,17 +508,69 @@ router.post(
 
     const { signedXdr } = req.body;
 
-    await db
+    if (!signedXdr && !config.ALLOW_LEGACY_REGISTER) {
+      throw new AppError(
+        "GONE",
+        "Server-signed registration is no longer supported",
+        {
+          message:
+            "Registrations must be signed by the resource owner. Use GET /resources/:id/register/prepare to obtain an unsigned transaction, sign it client-side, then submit the signed XDR via POST /resources/:id/register.",
+          nextSteps: [
+            `Call GET /resources/${resourceId}/register/prepare to get the unsignedXdr.`,
+            "Sign the transaction with the creator's wallet.",
+            `Submit the signed XDR as { "signedXdr": "..." } to POST /resources/${resourceId}/register.`,
+          ],
+        },
+      );
+    }
+
+    // Atomically claim the registration slot (#78): only one concurrent request
+    // can transition the resource out of none/failed. The loser gets no row.
+    const [claimed] = await db
       .update(resources)
-      .set({ onchainStatus: "pending" })
-      .where(eq(resources.id, resourceId));
+      .set({ onchainStatus: "pending", onchainPendingSince: new Date() })
+      .where(
+        and(
+          eq(resources.id, resourceId),
+          inArray(resources.onchainStatus, ["none", "failed"]),
+        ),
+      )
+      .returning();
+
+    if (!claimed) {
+      throw new AppError("CONFLICT", "Registration already in progress", {
+        message:
+          "An on-chain registration for this resource is already pending. A background worker retries pending registrations automatically for a few minutes.",
+        nextSteps: [
+          "Wait for the pending registration to settle — re-check this resource's onchainStatus shortly.",
+          `If it is still pending after several minutes, the retry worker marks it "failed", after which you can retry with POST /resources/${resourceId}/register.`,
+        ],
+      });
+    }
 
     try {
       if (signedXdr) {
-        // New flow: submit signed XDR
-        const result = await submitSignedTx(signedXdr);
+        // New flow: verify the signed XDR targets this resource, then submit.
+        const expected = {
+          contractId: REGISTRY_CONTRACT_ID,
+          functionName: "register",
+          resourceId,
+          owner: resource.walletAddress,
+        };
+        const validation = validateSignedTx(signedXdr, expected);
+        if (!validation.ok) {
+          await db
+            .update(resources)
+            .set({ onchainStatus: "failed" })
+            .where(eq(resources.id, resourceId));
+          throw new AppError("VALIDATION_ERROR", "Signed transaction does not match this resource", {
+            detail: validation.reason,
+          });
+        }
 
-        if (result.success) {
+        const result = await submitSignedTx(signedXdr, expected);
+
+        if (result.status === "confirmed") {
           getLogger().info(
             {
               event: "onchain_register",
@@ -498,6 +589,29 @@ router.post(
           res.json({
             id: updated.id,
             onchainStatus: updated.onchainStatus,
+            txHash: result.txHash,
+          });
+        } else if (result.status === "pending") {
+          // Still in flight — leave the resource pending so the worker can
+          // resolve it by hash (#77). Do not mark it failed on timeout.
+          getLogger().info(
+            {
+              event: "onchain_register",
+              resourceId,
+              txHash: result.txHash,
+              success: true,
+              pending: true,
+            },
+            "on-chain resource registration still pending",
+          );
+          await db
+            .update(resources)
+            .set({ onchainStatus: "pending", onchainTxHash: result.txHash })
+            .where(eq(resources.id, resourceId));
+
+          res.status(202).json({
+            id: resourceId,
+            onchainStatus: "pending",
             txHash: result.txHash,
           });
         } else {
@@ -580,15 +694,23 @@ router.post(
         });
       }
     } catch (err: any) {
-      getLogger().error(
-        { event: "onchain_register", resourceId, success: false, err },
-        "on-chain resource registration failed",
-      );
       // Mark failed but do NOT touch `listed` — resource stays available for purchase
       await db
         .update(resources)
         .set({ onchainStatus: "failed" })
         .where(eq(resources.id, resourceId));
+
+      // AppErrors raised inside the flow (e.g. the signed-flow failure) already
+      // carry tx hash, explorer link and guidance, and were logged there — pass
+      // them through unchanged so that context isn't lost or logged twice.
+      if (isAppError(err)) {
+        throw err;
+      }
+
+      getLogger().error(
+        { event: "onchain_register", resourceId, success: false, err },
+        "on-chain resource registration failed",
+      );
       const guidance = buildRegistrationFailureGuidance({
         resourceId,
         detail: err?.message,
@@ -647,35 +769,32 @@ router.post(
 
     const { signedXdr, price } = req.body;
 
-    // Submit the signed transaction via the registry client's underlying RPC server
-    const { rpc: StellarRpc, Transaction: StellarTransaction } =
-      await import("@stellar/stellar-sdk");
-    const rpcServer = new StellarRpc.Server(config.SOROBAN_RPC_URL);
-    const signedTx = new StellarTransaction(signedXdr, NETWORK_PASSPHRASE);
-    const sendResult = await rpcServer.sendTransaction(signedTx);
-
-    if (sendResult.status !== "PENDING") {
-      throw new AppError("UPSTREAM_ERROR", "Transaction rejected", {
-        detail: sendResult.status,
+    const expected = {
+      contractId: REGISTRY_CONTRACT_ID,
+      functionName: "set_price",
+      resourceId,
+      owner: resource.walletAddress,
+    };
+    const validation = validateSignedTx(signedXdr, expected);
+    if (!validation.ok) {
+      throw new AppError("VALIDATION_ERROR", "Signed transaction does not match this resource", {
+        detail: validation.reason,
       });
     }
 
-    // Poll for confirmation
-    const txHash = sendResult.hash;
-    let confirmed = false;
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      const txResult = await rpcServer.getTransaction(txHash);
-      if (txResult.status === StellarRpc.Api.GetTransactionStatus.SUCCESS) {
-        confirmed = true;
-        break;
-      }
-      if (txResult.status === StellarRpc.Api.GetTransactionStatus.FAILED) {
-        throw new AppError("UPSTREAM_ERROR", "Transaction failed on-chain");
-      }
+    const result = await submitSignedTx(signedXdr, expected);
+
+    if (result.status === "failed") {
+      throw new AppError("UPSTREAM_ERROR", "Transaction failed on-chain", {
+        detail: result.error,
+        txHash: result.txHash || undefined,
+      });
     }
-    if (!confirmed) {
-      throw new AppError("GATEWAY_TIMEOUT", "Transaction confirmation timed out");
+
+    if (result.status === "pending") {
+      // Still in flight — return the hash so the client can poll status.
+      res.status(202).json({ id: resourceId, txHash: result.txHash, status: "pending" });
+      return;
     }
 
     // Sync the DB price to match the on-chain value
@@ -734,33 +853,32 @@ router.post(
 
     const { signedXdr, newCreator } = req.body;
 
-    const { rpc: StellarRpc, Transaction: StellarTransaction } =
-      await import("@stellar/stellar-sdk");
-    const rpcServer = new StellarRpc.Server(config.SOROBAN_RPC_URL);
-    const signedTx = new StellarTransaction(signedXdr, NETWORK_PASSPHRASE);
-    const sendResult = await rpcServer.sendTransaction(signedTx);
-
-    if (sendResult.status !== "PENDING") {
-      throw new AppError("UPSTREAM_ERROR", "Transaction rejected", {
-        detail: sendResult.status,
+    const expected = {
+      contractId: REGISTRY_CONTRACT_ID,
+      functionName: "transfer_ownership",
+      resourceId,
+      owner: resource.walletAddress,
+    };
+    const validation = validateSignedTx(signedXdr, expected);
+    if (!validation.ok) {
+      throw new AppError("VALIDATION_ERROR", "Signed transaction does not match this resource", {
+        detail: validation.reason,
       });
     }
 
-    const txHash = sendResult.hash;
-    let confirmed = false;
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      const txResult = await rpcServer.getTransaction(txHash);
-      if (txResult.status === StellarRpc.Api.GetTransactionStatus.SUCCESS) {
-        confirmed = true;
-        break;
-      }
-      if (txResult.status === StellarRpc.Api.GetTransactionStatus.FAILED) {
-        throw new AppError("UPSTREAM_ERROR", "Transaction failed on-chain");
-      }
+    const result = await submitSignedTx(signedXdr, expected);
+
+    if (result.status === "failed") {
+      throw new AppError("UPSTREAM_ERROR", "Transaction failed on-chain", {
+        detail: result.error,
+        txHash: result.txHash || undefined,
+      });
     }
-    if (!confirmed) {
-      throw new AppError("GATEWAY_TIMEOUT", "Transaction confirmation timed out");
+
+    if (result.status === "pending") {
+      // Still in flight — return the hash so the client can poll status.
+      res.status(202).json({ id: resourceId, txHash: result.txHash, status: "pending" });
+      return;
     }
 
     const [updated] = await db

@@ -6,15 +6,18 @@ import { resources } from "../db/schema.js";
 import type { RoutesConfig } from "@x402/core/server";
 import { getLogger } from "../lib/logger.js";
 import { network, sharedX402ResourceServer } from "../lib/x402.js";
-import { getResource } from "../services/registryClient.js";
-import { getOnChainPrice, normalizeUsdcPrice } from "../lib/stellarRegistry.js";
+import { getOnChainPrice, normalizeUsdcPrice, stroopsToUsdc } from "../lib/stellarRegistry.js";
+import { createTtlCache } from "../lib/ttlCache.js";
 
-// Cache middleware instances by resource ID to avoid re-creating on every request
-const middlewareCache = new Map<
-  string,
-  { mw: ReturnType<typeof paymentMiddleware>; expiresAt: number }
->();
 const CACHE_TTL_MS = 60_000; // 1 minute
+const MIDDLEWARE_CACHE_MAX_SIZE = 1000;
+
+// Cache middleware instances by resource ID to avoid re-creating on every request.
+// Expired entries are evicted and the cache size is bounded.
+const middlewareCache = createTtlCache<ReturnType<typeof paymentMiddleware>>({
+  ttlMs: CACHE_TTL_MS,
+  maxSize: MIDDLEWARE_CACHE_MAX_SIZE,
+});
 
 export async function dynamicPaywall(req: Request, res: Response, next: NextFunction) {
   const resourceId = req.params.id as string;
@@ -89,30 +92,19 @@ export async function dynamicPaywall(req: Request, res: Response, next: NextFunc
   // Attach resource to request for the delivery handler
   (req as any).resource = resource;
 
-  // Try to get on-chain price if resource is registered
+  // Derive the final price from the on-chain price already fetched above
+  // (cached per TTL), so each resource is looked up once per TTL window.
   let finalPrice = resource.price;
   if (resource.onchainStatus === "registered") {
-    try {
-      const onchainResource = await getResource(resourceId);
-      if (onchainResource) {
-        // Convert from stroops (7 decimals) to USDC string
-        const onchainPriceUsdc = (Number(onchainResource.price) / 10_000_000).toString();
-        finalPrice = onchainPriceUsdc;
-      }
-    } catch (error) {
-      getLogger().warn(
-        { event: "paywall_onchain_price_fallback", resourceId, err: error },
-        "failed to fetch on-chain price; using database price",
-      );
-      // Fall back to database price
-    }
+    // Convert from stroops (7 decimals) to a fixed-decimal USDC string
+    finalPrice = stroopsToUsdc(BigInt(onChainPrice));
   }
 
   // Check cache with final price as part of cache key
   const cacheKey = `${resourceId}:${finalPrice}`;
   const cached = middlewareCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.mw(req, res, next);
+  if (cached) {
+    return cached(req, res, next);
   }
 
   // Build route config for this specific resource
@@ -132,10 +124,7 @@ export async function dynamicPaywall(req: Request, res: Response, next: NextFunc
   const mw = paymentMiddleware(routes, sharedX402ResourceServer);
 
   // Cache it with the final price key
-  middlewareCache.set(cacheKey, {
-    mw,
-    expiresAt: Date.now() + CACHE_TTL_MS,
-  });
+  middlewareCache.set(cacheKey, mw);
 
   return mw(req, res, next);
 }

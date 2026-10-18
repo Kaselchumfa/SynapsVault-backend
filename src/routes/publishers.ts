@@ -258,8 +258,16 @@ router.post("/publishers/me/webhooks/test", apiKeyAuth, publisherRateLimit, asyn
 
 // GET /publishers/leaderboard — public creator leaderboard
 router.get("/publishers/leaderboard", async (_req, res) => {
-  // Get all publishers with their resource and payment stats
-  const allPublishers = await db.select().from(publishers);
+  // Get all publishers with their resource and payment stats.
+  // Only public columns are selected so secrets (apiKeyHash, webhookSecret) never leave the DB.
+  const allPublishers = await db
+    .select({
+      id: publishers.id,
+      name: publishers.name,
+      walletAddress: publishers.walletAddress,
+      createdAt: publishers.createdAt,
+    })
+    .from(publishers);
   const allResources = await db
     .select({
       id: resources.id,

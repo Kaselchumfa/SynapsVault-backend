@@ -65,13 +65,18 @@ jobs:
       - name: Build image
         run: docker build -t synapsvault-backend:ci .
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Apply migrations
         env:
-          PGPASSWORD: synapse
-        run: |
-          for f in $(ls drizzle/*.sql | sort); do
-            psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U synapse -d synapsvault -q -f "$f"
-          done
+          DATABASE_URL: postgres://synapse:synapse@127.0.0.1:5432/synapsvault
+        run: npm run db:migrate
 
       - name: Start container
         run: |

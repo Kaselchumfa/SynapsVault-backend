@@ -376,6 +376,89 @@ export const openApiSpec = {
         },
         required: ["delivered", "attempts"],
       },
+      Payment: {
+        type: "object",
+        description: "A settled or attempted payment for a resource.",
+        properties: {
+          id: { type: "string" },
+          resourceId: { type: "string" },
+          resourceTitle: { type: "string", nullable: true },
+          payer: { type: "string", description: "Buyer Stellar wallet address" },
+          recipient: { type: "string", description: "Publisher Stellar wallet address" },
+          amount: { type: "string", example: "0.50" },
+          currency: { type: "string", example: "USDC" },
+          status: { type: "string", enum: ["pending", "succeeded", "failed"] },
+          txHash: { type: "string", nullable: true },
+          createdAt: { type: "string", format: "date-time" },
+        },
+        required: ["id", "resourceId", "payer", "amount", "currency", "status", "createdAt"],
+      },
+      PaymentReceipt: {
+        type: "object",
+        description: "Receipt for a completed payment, available to the payer or the recipient publisher.",
+        properties: {
+          payment: { $ref: "#/components/schemas/Payment" },
+          resource: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+            },
+          },
+          issuedAt: { type: "string", format: "date-time" },
+        },
+        required: ["payment", "issuedAt"],
+      },
+      AdminStatsResponse: {
+        type: "object",
+        description: "Platform-wide statistics for administrators.",
+        properties: {
+          publishers: { type: "integer" },
+          resources: {
+            type: "object",
+            properties: {
+              total: { type: "integer" },
+              listed: { type: "integer" },
+              verified: { type: "integer" },
+              delisted: { type: "integer" },
+            },
+          },
+          payments: {
+            type: "object",
+            properties: {
+              total: { type: "integer" },
+              succeeded: { type: "integer" },
+              failed: { type: "integer" },
+              volumeUsdc: { type: "string" },
+            },
+          },
+          timestamp: { type: "string", format: "date-time" },
+        },
+      },
+      AdminAuditEntry: {
+        type: "object",
+        description: "A single administrative action recorded in the audit log.",
+        properties: {
+          id: { type: "string" },
+          action: { type: "string", example: "resource.delist" },
+          resourceId: { type: "string", nullable: true },
+          actor: { type: "string", description: "Identifier of the admin or system actor" },
+          details: { nullable: true, description: "Optional structured context for the action." },
+          createdAt: { type: "string", format: "date-time" },
+        },
+        required: ["id", "action", "createdAt"],
+      },
+      AdminAuditResponse: {
+        type: "object",
+        description: "Paginated audit log entries.",
+        properties: {
+          entries: { type: "array", items: { $ref: "#/components/schemas/AdminAuditEntry" } },
+          total: { type: "integer" },
+          page: { type: "integer" },
+          limit: { type: "integer" },
+        },
+        required: ["entries", "total", "page", "limit"],
+      },
       MetricsResponse: {
         type: "object",
         description: "Service metrics snapshot for observability and monitoring.",
@@ -501,7 +584,11 @@ export const openApiSpec = {
         responses: {
           "200": {
             description: "Payments made by this buyer",
-            content: { "application/json": { schema: { type: "array", items: { type: "object" } } } },
+            content: {
+              "application/json": {
+                schema: { type: "array", items: { $ref: "#/components/schemas/Payment" } },
+              },
+            },
           },
           "401": {
             description: "Missing, invalid, or expired wallet signature",
@@ -544,7 +631,7 @@ export const openApiSpec = {
         responses: {
           "200": {
             description: "Receipt for an authorized payer or recipient publisher",
-            content: { "application/json": { schema: { type: "object" } } },
+            content: { "application/json": { schema: { $ref: "#/components/schemas/PaymentReceipt" } } },
           },
           "401": {
             description: "Missing or invalid authentication",
@@ -1032,6 +1119,27 @@ export const openApiSpec = {
         },
       },
     },
+    "/resources/{id}/thumbnail": {
+      get: {
+        tags: ["Resources"],
+        summary: "Get resource thumbnail image",
+        operationId: "getResourceThumbnail",
+        description: "Returns the resource's thumbnail image. No payment required.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": {
+            description: "Thumbnail image",
+            content: {
+              "image/*": { schema: { type: "string", format: "binary" } },
+            },
+          },
+          "404": {
+            description: "Resource or thumbnail not found",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
     "/resources/{id}/verification": {
       get: {
         tags: ["Resources"],
@@ -1142,15 +1250,17 @@ export const openApiSpec = {
         security: [{ ApiKeyAuth: [], RequestSignature: [] }],
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: {
+          required: true,
           content: {
             "application/json": {
               schema: {
                 type: "object",
+                required: ["signedXdr"],
                 properties: {
                   signedXdr: {
                     type: "string",
                     description:
-                      "Signed Stellar transaction XDR (omit to use legacy server-signed flow)",
+                      "Signed Stellar transaction XDR produced by the resource owner. The server never signs registrations on the creator's behalf.",
                   },
                 },
               },
@@ -1174,7 +1284,13 @@ export const openApiSpec = {
             },
           },
           "400": {
-            description: "Not verified",
+            description:
+              "Missing `signedXdr` or resource not verified. The legacy server-signed registration flow is no longer supported; clients must submit a signed transaction.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "410": {
+            description:
+              "The legacy server-signed registration flow has been removed. Submit `signedXdr` from the resource owner's wallet.",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           "401": {
@@ -1494,6 +1610,115 @@ export const openApiSpec = {
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/AgentStatusResponse" } },
             },
+          },
+        },
+      },
+    },
+
+    // ── Admin ───────────────────────────────────────────────────────────────
+    "/admin/stats": {
+      get: {
+        tags: ["Admin"],
+        summary: "Platform-wide statistics",
+        operationId: "getAdminStats",
+        security: [{ AdminKey: [] }],
+        responses: {
+          "200": {
+            description: "Platform statistics",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/AdminStatsResponse" } },
+            },
+          },
+          "401": {
+            description: "Missing or invalid admin key",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/admin/delist/{id}": {
+      post: {
+        tags: ["Admin"],
+        summary: "Administratively delist a resource",
+        operationId: "adminDelistResource",
+        security: [{ AdminKey: [] }],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": {
+            description: "Resource delisted",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Resource" } } },
+          },
+          "401": {
+            description: "Missing or invalid admin key",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "404": {
+            description: "Resource not found",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/admin/audit": {
+      get: {
+        tags: ["Admin"],
+        summary: "Query the administrative audit log",
+        operationId: "getAdminAudit",
+        security: [{ AdminKey: [] }],
+        parameters: [
+          {
+            name: "resourceId",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description: "Filter entries by resource id",
+          },
+          {
+            name: "payer",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description: "Filter entries by payer wallet address",
+          },
+          {
+            name: "from",
+            in: "query",
+            required: false,
+            schema: { type: "string", format: "date-time" },
+            description: "Only include entries at or after this timestamp",
+          },
+          {
+            name: "to",
+            in: "query",
+            required: false,
+            schema: { type: "string", format: "date-time" },
+            description: "Only include entries at or before this timestamp",
+          },
+          {
+            name: "page",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 1, default: 1 },
+            description: "Page number (1-based)",
+          },
+          {
+            name: "limit",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+            description: "Page size (1-100, default 20)",
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Paginated audit log entries",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/AdminAuditResponse" } },
+            },
+          },
+          "401": {
+            description: "Missing or invalid admin key",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },

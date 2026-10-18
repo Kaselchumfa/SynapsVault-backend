@@ -36,6 +36,12 @@ vi.mock("../services/registryClient.js", () => ({
 vi.mock("../lib/stellarRegistry.js", () => ({
   getOnChainPrice: mockGetOnChainPrice,
   normalizeUsdcPrice: mockNormalizeUsdcPrice,
+  stroopsToUsdc: (stroops: bigint | string) => {
+    const value = BigInt(stroops);
+    const whole = value / 10_000_000n;
+    const fraction = (value % 10_000_000n).toString().padStart(7, "0");
+    return `${whole}.${fraction}`;
+  },
   OnChainLookupError: MockOnChainLookupError,
 }));
 vi.mock("../db/client.js", () => ({
@@ -226,5 +232,95 @@ describe("dynamicPaywall middleware", () => {
 
     expect(mockPaymentMiddleware).toHaveBeenCalled();
     expect(next).toHaveBeenCalled();
+  });
+
+  it("formats a 1-stroop price as 0.0000001 for the payment middleware", async () => {
+    const resource = listedResource({ id: "r-stroop", price: "0.0000001", onchainStatus: "none" });
+    const dbMock = makeDbSelect(resource);
+    const { db } = await import("../db/client.js");
+    const { dynamicPaywall } = await import("./dynamicPaywall.js");
+    (db as any).select = dbMock.select;
+
+    mockGetOnChainPrice.mockResolvedValue({ price: "1", creator: "GABC" });
+    mockNormalizeUsdcPrice.mockReturnValue("0.0000001");
+    mockPaymentMiddleware.mockReturnValue((_req, _res, next) => next());
+
+    const req = createRequest("r-stroop");
+    const res = createResponse();
+    const next = createNext();
+
+    await dynamicPaywall(req, res, next);
+
+    expect(mockPaymentMiddleware).toHaveBeenCalled();
+    const routes = mockPaymentMiddleware.mock.calls[0][0] as Record<string, any>;
+    const route = routes["GET /api/resources/:id"];
+    expect(route).toBeDefined();
+    expect(route.accepts[0].price).toBe("0.0000001");
+    expect(next).toHaveBeenCalled();
+  });
+
+  it("performs one RPC lookup per resource per TTL window", async () => {
+    const resource = listedResource({ id: "r-ttl", price: "0.50", onchainStatus: "none" });
+    const dbMock = makeDbSelect(resource);
+    const { db } = await import("../db/client.js");
+    const { dynamicPaywall } = await import("./dynamicPaywall.js");
+    (db as any).select = dbMock.select;
+
+    mockGetOnChainPrice.mockResolvedValue({ price: "0.5000000", creator: "GABC" });
+    mockNormalizeUsdcPrice.mockReturnValue("0.5000000");
+    mockPaymentMiddleware.mockReturnValue((_req, _res, next) => next());
+
+    await dynamicPaywall(createRequest("r-ttl"), createResponse(), createNext());
+    await dynamicPaywall(createRequest("r-ttl"), createResponse(), createNext());
+
+    expect(mockGetOnChainPrice).toHaveBeenCalledTimes(1);
+  });
+
+  it("evicts expired middleware cache entries after the TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      const resource = listedResource({ id: "r-evict", price: "0.50", onchainStatus: "none" });
+      const dbMock = makeDbSelect(resource);
+      const { db } = await import("../db/client.js");
+      const { dynamicPaywall, middlewareCache } = await import("./dynamicPaywall.js");
+      (db as any).select = dbMock.select;
+
+      mockGetOnChainPrice.mockResolvedValue({ price: "0.5000000", creator: "GABC" });
+      mockNormalizeUsdcPrice.mockReturnValue("0.5000000");
+      mockPaymentMiddleware.mockReturnValue((_req, _res, next) => next());
+
+      await dynamicPaywall(createRequest("r-evict"), createResponse(), createNext());
+      expect(middlewareCache.size).toBeGreaterThan(0);
+
+      vi.advanceTimersByTime(10 * 60 * 1000);
+
+      await dynamicPaywall(createRequest("r-evict"), createResponse(), createNext());
+
+      expect(middlewareCache.size).toBeLessThanOrEqual(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the middleware cache size under the configured cap", async () => {
+    const { dynamicPaywall, middlewareCache, MIDDLEWARE_CACHE_MAX_SIZE } = await import(
+      "./dynamicPaywall.js"
+    );
+
+    mockPaymentMiddleware.mockReturnValue((_req, _res, next) => next());
+
+    for (let i = 0; i < MIDDLEWARE_CACHE_MAX_SIZE + 50; i++) {
+      const id = `r-cap-${i}`;
+      const dbMock = makeDbSelect(listedResource({ id, price: "0.50", onchainStatus: "none" }));
+      const { db } = await import("../db/client.js");
+      (db as any).select = dbMock.select;
+
+      mockGetOnChainPrice.mockResolvedValue({ price: "0.5000000", creator: "GABC" });
+      mockNormalizeUsdcPrice.mockReturnValue("0.5000000");
+
+      await dynamicPaywall(createRequest(id), createResponse(), createNext());
+    }
+
+    expect(middlewareCache.size).toBeLessThanOrEqual(MIDDLEWARE_CACHE_MAX_SIZE);
   });
 });
