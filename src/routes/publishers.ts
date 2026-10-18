@@ -11,7 +11,7 @@ import {
 } from "../schemas/requests.js";
 import { registerPublisher, getPublisherResources } from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sum, count, sql, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments } from "../db/schema.js";
 import { config } from "../config.js";
@@ -98,29 +98,61 @@ router.get("/publishers/me/analytics", apiKeyAuth, async (req, res) => {
     .where(eq(resources.publisherId, publisherId));
 
   const resourceIds = pubResources.map((r) => r.id);
+  const walletAddress = req.publisher!.walletAddress;
 
-  // Get all payments for these resources
-  let allPayments: any[] = [];
+  // Aggregate per-resource stats in SQL (one query).
+  let aggregateRows: { resourceId: string; totalSales: number; totalEarned: string | null }[] = [];
   if (resourceIds.length > 0) {
-    allPayments = await db
+    aggregateRows = await db
       .select({
-        id: payments.id,
         resourceId: payments.resourceId,
-        payerAddress: payments.payerAddress,
-        recipientAddress: payments.recipientAddress,
-        amount: payments.amount,
-        paidAt: payments.paidAt,
+        totalSales: count(payments.id),
+        totalEarned: sum(payments.amount),
       })
       .from(payments)
-      .where(inArray(payments.resourceId, resourceIds));
+      .where(
+        sql`${payments.resourceId} IN ${resourceIds} AND ${payments.recipientAddress} = ${walletAddress}`,
+      )
+      .groupBy(payments.resourceId);
   }
 
-  // Compute per-resource stats
+  const aggregateByResource = new Map(aggregateRows.map((row) => [row.resourceId, row]));
+
+  // Recent payments per resource, paginated in SQL (ORDER BY paid_at DESC LIMIT 5).
+  const recentByResource = new Map<
+    string,
+    { payerAddress: string; amount: string; paidAt: Date }[]
+  >();
+  if (resourceIds.length > 0) {
+    const recentRows = await db
+      .select({
+        resourceId: payments.resourceId,
+        payerAddress: payments.payerAddress,
+        amount: payments.amount,
+        paidAt: payments.paidAt,
+        rn: sql<number>`row_number() over (partition by ${payments.resourceId} order by ${payments.paidAt} desc)`.as(
+          "rn",
+        ),
+      })
+      .from(payments)
+      .where(
+        sql`${payments.resourceId} IN ${resourceIds} AND ${payments.recipientAddress} = ${walletAddress}`,
+      )
+      .orderBy(payments.resourceId, desc(payments.paidAt));
+
+    for (const row of recentRows) {
+      if (row.rn > 5) continue;
+      const list = recentByResource.get(row.resourceId) ?? [];
+      list.push({ payerAddress: row.payerAddress, amount: row.amount, paidAt: row.paidAt });
+      recentByResource.set(row.resourceId, list);
+    }
+  }
+
+  // Compute per-resource stats from the aggregate result.
   const resourceStats = pubResources.map((r) => {
-    const resourcePayments = allPayments.filter(
-      (p) => p.resourceId === r.id && p.recipientAddress === req.publisher!.walletAddress,
-    );
-    const totalEarned = resourcePayments.reduce((sum, p) => sum + parseFloat(p.amount), 0);
+    const agg = aggregateByResource.get(r.id);
+    const totalSales = agg?.totalSales ?? 0;
+    const totalEarned = agg?.totalEarned ? parseFloat(agg.totalEarned) : 0;
     return {
       id: r.id,
       title: r.title,
@@ -129,22 +161,18 @@ router.get("/publishers/me/analytics", apiKeyAuth, async (req, res) => {
       verificationStatus: r.verificationStatus,
       listed: r.listed,
       createdAt: r.createdAt,
-      totalSales: resourcePayments.length,
+      totalSales,
       totalEarned: totalEarned.toFixed(4),
-      recentPayments: resourcePayments.slice(0, 5).map((p) => ({
-        payerAddress: p.payerAddress,
-        amount: p.amount,
-        paidAt: p.paidAt,
-      })),
+      recentPayments: recentByResource.get(r.id) ?? [],
     };
   });
 
-  // Summary
-  const validPayments = allPayments.filter(
-    (p) => p.recipientAddress === req.publisher!.walletAddress,
+  // Summary — derived from the same aggregate result.
+  const totalEarned = aggregateRows.reduce(
+    (acc, row) => acc + (row.totalEarned ? parseFloat(row.totalEarned) : 0),
+    0,
   );
-  const totalEarned = validPayments.reduce((sum, p) => sum + parseFloat(p.amount), 0);
-  const totalSales = validPayments.length;
+  const totalSales = aggregateRows.reduce((acc, row) => acc + row.totalSales, 0);
   const totalResources = pubResources.length;
   const listedResources = pubResources.filter((r) => r.listed).length;
   const verifiedResources = pubResources.filter((r) => r.verificationStatus === "verified").length;

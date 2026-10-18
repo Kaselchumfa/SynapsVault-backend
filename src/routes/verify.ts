@@ -1,9 +1,9 @@
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import { paymentMiddleware } from "@x402/express";
 import type { RoutesConfig } from "@x402/core/server";
-import { and, eq, desc, inArray, isNull } from "drizzle-orm";
+import { and, eq, desc, inArray, isNull, sum, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { resources, verifications } from "../db/schema.js";
+import { resources, verifications, payments } from "../db/schema.js";
 import { checkOriginality } from "../services/verificationService.js";
 import { emitToPublisher } from "../services/webhookService.js";
 
@@ -225,8 +225,26 @@ router.get("/agent/status", async (_req, res) => {
   const totalVerifications = allVerifications.length;
   const verified = allVerifications.filter((v) => v.isOriginal).length;
   const rejected = allVerifications.filter((v) => !v.isOriginal).length;
-  const pricePerVerification = parseFloat(config.VERIFICATION_PRICE);
-  const totalEarned = totalVerifications * pricePerVerification;
+
+  // Sum the amounts actually recorded for settled verification payments to the
+  // agent's wallet. Rejected or unsettled calls are excluded, and historical
+  // price changes are reflected because we sum recorded amounts, not list price.
+  const [earningsRow] = await db
+    .select({
+      total: sum(sql<string>`cast(${payments.amount} as numeric)`),
+    })
+    .from(payments)
+    .innerJoin(verifications, eq(payments.verificationId, verifications.id))
+    .where(
+      and(
+        eq(payments.recipientAddress, config.PAY_TO),
+        eq(payments.status, "settled"),
+        eq(verifications.isOriginal, true),
+      ),
+    );
+
+  const totalEarned = earningsRow?.total ? Number(earningsRow.total) : 0;
+
   const avgConfidence =
     totalVerifications > 0
       ? allVerifications.reduce((sum, v) => sum + v.confidence, 0) / totalVerifications

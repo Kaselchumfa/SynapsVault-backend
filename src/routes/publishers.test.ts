@@ -31,6 +31,10 @@ const authedPublisher = {
 let publishersLookupRows: Array<typeof authedPublisher>;
 let resourcesRows: any[];
 let paymentsRows: any[];
+// Rows returned by the GROUP BY aggregate query (per-resource totals).
+let aggregateRows: any[];
+// Rows returned by the paginated recent-payments query.
+let recentPaymentsRows: any[];
 
 vi.mock("../db/client.js", () => ({
   db: {
@@ -43,7 +47,17 @@ vi.mock("../db/client.js", () => ({
           return { where: () => Promise.resolve(resourcesRows) };
         }
         if (table === PAYMENTS_MARKER) {
-          return { where: () => Promise.resolve(paymentsRows) };
+          // Aggregate path: select(...).from(payments).where(...).groupBy(...)
+          // Recent-payments path: select(...).from(payments).where(...).orderBy(...).limit(...).offset(...)
+          const chain: any = {
+            groupBy: () => Promise.resolve(aggregateRows),
+            orderBy: () => chain,
+            limit: () => chain,
+            offset: () => Promise.resolve(recentPaymentsRows),
+            then: (resolve: (rows: any[]) => unknown) =>
+              Promise.resolve(paymentsRows).then(resolve),
+          };
+          return { where: () => chain };
         }
         throw new Error("unexpected table in select().from()");
       },
@@ -267,6 +281,8 @@ describe("GET /publishers/me/analytics — auth + aggregation (#294)", () => {
     publishersLookupRows = [authedPublisher];
     resourcesRows = [];
     paymentsRows = [];
+    aggregateRows = [];
+    recentPaymentsRows = [];
   });
 
   it("returns 401 without a valid API key", async () => {
@@ -305,7 +321,10 @@ describe("GET /publishers/me/analytics — auth + aggregation (#294)", () => {
         createdAt: new Date("2026-01-01"),
       },
     ];
-    paymentsRows = [
+    // The SQL aggregate already filters by recipient wallet, so only the
+    // publisher's own payment is reflected in the grouped totals.
+    aggregateRows = [{ resourceId: "res-1", totalSales: 1, totalEarned: "5.00" }];
+    recentPaymentsRows = [
       {
         id: "pay-1",
         resourceId: "res-1",
@@ -313,14 +332,6 @@ describe("GET /publishers/me/analytics — auth + aggregation (#294)", () => {
         recipientAddress: "GALICE",
         amount: "5.00",
         paidAt: new Date("2026-01-02"),
-      },
-      {
-        id: "pay-2",
-        resourceId: "res-1",
-        payerAddress: "GBUYER2",
-        recipientAddress: "GSOMEONE_ELSE",
-        amount: "99.00",
-        paidAt: new Date("2026-01-03"),
       },
     ];
 
@@ -337,5 +348,111 @@ describe("GET /publishers/me/analytics — auth + aggregation (#294)", () => {
       totalSales: 1,
       totalEarned: "5.0000",
     });
+  });
+
+  it("SQL aggregate totals match the previous in-memory implementation", async () => {
+    resourcesRows = [
+      {
+        id: "res-1",
+        title: "Doc",
+        price: "5.00",
+        verificationStatus: "verified",
+        listed: true,
+        createdAt: new Date("2026-01-01"),
+      },
+      {
+        id: "res-2",
+        title: "Guide",
+        price: "2.50",
+        verificationStatus: "pending",
+        listed: false,
+        createdAt: new Date("2026-01-02"),
+      },
+      {
+        id: "res-3",
+        title: "Unpaid",
+        price: "1.00",
+        verificationStatus: "verified",
+        listed: true,
+        createdAt: new Date("2026-01-03"),
+      },
+    ];
+    paymentsRows = [
+      {
+        id: "pay-1",
+        resourceId: "res-1",
+        payerAddress: "GBUYER",
+        recipientAddress: "GALICE",
+        amount: "5.00",
+        paidAt: new Date("2026-01-04"),
+      },
+      {
+        id: "pay-2",
+        resourceId: "res-1",
+        payerAddress: "GBUYER2",
+        recipientAddress: "GALICE",
+        amount: "5.00",
+        paidAt: new Date("2026-01-05"),
+      },
+      {
+        id: "pay-3",
+        resourceId: "res-2",
+        payerAddress: "GBUYER",
+        recipientAddress: "GALICE",
+        amount: "2.50",
+        paidAt: new Date("2026-01-06"),
+      },
+      {
+        id: "pay-4",
+        resourceId: "res-2",
+        payerAddress: "GBUYER3",
+        recipientAddress: "GSOMEONE_ELSE",
+        amount: "99.00",
+        paidAt: new Date("2026-01-07"),
+      },
+    ];
+
+    // Reference: the previous in-memory implementation.
+    const ownPayments = paymentsRows.filter((p) => p.recipientAddress === "GALICE");
+    const expectedByResource = new Map<string, { totalSales: number; totalEarned: number }>();
+    for (const p of ownPayments) {
+      const prev = expectedByResource.get(p.resourceId) ?? { totalSales: 0, totalEarned: 0 };
+      expectedByResource.set(p.resourceId, {
+        totalSales: prev.totalSales + 1,
+        totalEarned: prev.totalEarned + Number(p.amount),
+      });
+    }
+    const expectedTotalEarned = ownPayments
+      .reduce((sum, p) => sum + Number(p.amount), 0)
+      .toFixed(4);
+    const expectedTotalSales = ownPayments.length;
+
+    // SQL aggregate result for the same fixture data.
+    aggregateRows = Array.from(expectedByResource.entries()).map(([resourceId, t]) => ({
+      resourceId,
+      totalSales: t.totalSales,
+      totalEarned: t.totalEarned.toFixed(2),
+    }));
+    recentPaymentsRows = ownPayments.slice(0, 2);
+
+    const res = await request(createTestApp())
+      .get("/publishers/me/analytics")
+      .set("x-api-key", VALID_API_KEY);
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.totalEarned).toBe(expectedTotalEarned);
+    expect(res.body.summary.totalSales).toBe(expectedTotalSales);
+    expect(res.body.summary.totalResources).toBe(3);
+    expect(res.body.summary.listedResources).toBe(2);
+
+    const byId = new Map<string, any>(res.body.resources.map((r: any) => [r.id, r]));
+    for (const [resourceId, expected] of expectedByResource) {
+      expect(byId.get(resourceId)).toMatchObject({
+        totalSales: expected.totalSales,
+        totalEarned: expected.totalEarned.toFixed(4),
+      });
+    }
+    // Resources with no payments report zeroed totals.
+    expect(byId.get("res-3")).toMatchObject({ totalSales: 0, totalEarned: "0.0000" });
   });
 });
