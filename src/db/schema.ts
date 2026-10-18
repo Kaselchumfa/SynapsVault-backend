@@ -26,6 +26,12 @@ export const onchainStatusEnum = pgEnum("onchain_status_enum", [
   "failed",
 ]);
 
+export const paymentStatusEnum = pgEnum("payment_status", [
+  "pending",
+  "settled",
+  "failed",
+]);
+
 export const thumbnailStatusEnum = pgEnum("thumbnail_status_enum", [
   "none",
   "pending",
@@ -169,13 +175,41 @@ export const payments = pgTable(
     payerAddress: text("payer_address").notNull(),
     recipientAddress: text("recipient_address").notNull(),
     amount: text("amount").notNull(), // USDC amount
+    // Settlement state of the payment. Only settled payments count toward
+    // earnings (#99).
+    status: paymentStatusEnum("status").notNull().default("pending"),
     paidAt: timestamp("paid_at").defaultNow().notNull(),
   },
   (table) => ({
     // Payment history is queried per payer wallet (#285).
     payerAddressIdx: index("idx_payments_payer_address").on(table.payerAddress),
-    // Analytics and delist lookups filter payments by resource (#107).
+    // Publisher analytics aggregate per resource (#100), and analytics and
+    // delist lookups filter payments by resource (#107).
     resourceIdIdx: index("idx_payments_resource_id").on(table.resourceId),
+    // Agent-status earnings sum per recipient (#99).
+    recipientAddressIdx: index("idx_payments_recipient_address").on(table.recipientAddress),
+  }),
+);
+
+// Failed events — on-chain events whose handler threw, kept for retry so the
+// listener checkpoint can stop before them without losing the event (#101).
+export const failedEvents = pgTable(
+  "failed_events",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    eventId: text("event_id").notNull(),
+    ledger: integer("ledger").notNull(),
+    topic: text("topic").notNull(),
+    payload: text("payload").notNull(), // JSON stringified event payload
+    error: text("error").notNull(),
+    attempts: integer("attempts").notNull().default(1),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    eventIdIdx: index("idx_failed_events_event_id").on(table.eventId),
+    ledgerIdx: index("idx_failed_events_ledger").on(table.ledger),
   }),
 );
 
