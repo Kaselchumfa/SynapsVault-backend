@@ -244,6 +244,11 @@ const envSchema = z.object({
   WEBHOOK_TIMEOUT_MS: z.coerce.number().default(10_000),
   WEBHOOK_MAX_ATTEMPTS: z.coerce.number().default(3),
 
+  // Retry worker (#85): max items processed per tick and per-item timeout so a
+  // slow RPC can't make a tick run into the next one.
+  RETRY_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).default(25),
+  RETRY_WORKER_ITEM_TIMEOUT_MS: z.coerce.number().int().min(1).default(30_000),
+
   // Optional Redis URL for a shared sliding-window rate-limit store (multi-instance).
   REDIS_URL: z.string().url().optional(),
 

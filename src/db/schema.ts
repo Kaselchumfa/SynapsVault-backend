@@ -75,6 +75,9 @@ export const resources = pgTable(
     adminDelistedAt: timestamp("admin_delisted_at"),
     onchainStatus: onchainStatusEnum("onchain_status").notNull().default("none"),
     onchainTxHash: text("onchain_tx_hash"),
+    // Number of on-chain registration attempts made so far. Persisted so the
+    // retry budget survives worker restarts (#84).
+    onchainAttempts: integer("onchain_attempts").notNull().default(0),
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => ({
@@ -124,6 +127,9 @@ export const payments = pgTable(
     payerAddress: text("payer_address").notNull(),
     recipientAddress: text("recipient_address").notNull(),
     amount: text("amount").notNull(), // USDC amount
+    // Delivery state of the purchased content: "delivered" once the file was
+    // served, "undelivered" when the download failed after payment (#86).
+    deliveryStatus: text("delivery_status").notNull().default("delivered"),
     paidAt: timestamp("paid_at").defaultNow().notNull(),
   },
   (table) => ({

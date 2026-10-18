@@ -268,29 +268,39 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     }
   }
 
-  const [payment] = await db
-    .insert(payments)
-    .values({
-      resourceId: resource.id,
-      payerAddress,
-      recipientAddress: resource.walletAddress,
-      amount: resource.price,
-    })
-    .returning();
-
-  // Fire-and-forget: webhook delivery never delays or fails content access.
-  const purchase = {
-    paymentId: payment.id,
-    resourceId: payment.resourceId,
-    amount: payment.amount,
-    payerAddress: payment.payerAddress,
-    recipientAddress: payment.recipientAddress,
-    paidAt: payment.paidAt,
+  // Records a payment row with an explicit delivery status so an undelivered
+  // purchase can be reconciled later (#86).
+  const recordPayment = async (deliveryStatus: "delivered" | "undelivered") => {
+    const [payment] = await db
+      .insert(payments)
+      .values({
+        resourceId: resource.id,
+        payerAddress,
+        recipientAddress: resource.walletAddress,
+        amount: resource.price,
+        deliveryStatus,
+      })
+      .returning();
+    return payment;
   };
-  void emitToPublisher(resource.publisherId, "resource.purchased", purchase);
-  void emitToPublisher(resource.publisherId, "payment.received", purchase);
+
+  const emitPurchase = (payment: typeof payments.$inferSelect) => {
+    // Fire-and-forget: webhook delivery never delays or fails content access.
+    const purchase = {
+      paymentId: payment.id,
+      resourceId: payment.resourceId,
+      amount: payment.amount,
+      payerAddress: payment.payerAddress,
+      recipientAddress: payment.recipientAddress,
+      paidAt: payment.paidAt,
+    };
+    void emitToPublisher(resource.publisherId, "resource.purchased", purchase);
+    void emitToPublisher(resource.publisherId, "payment.received", purchase);
+  };
 
   if (resource.resourceType === "link") {
+    const payment = await recordPayment("delivered");
+    emitPurchase(payment);
     res.json({
       url: resource.externalUrl,
       receipt: {
@@ -309,12 +319,39 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     throw new AppError("INTERNAL_ERROR", "Resource file not found");
   }
 
+  // Fetch the content *before* recording the payment so a storage failure
+  // never leaves a silently undelivered purchase.
+  let fileContent: Awaited<ReturnType<typeof downloadFile>>;
+  try {
+    fileContent = await downloadFile(resource.storagePath);
+  } catch (err) {
+    const payment = await recordPayment("undelivered");
+    getLogger().error(
+      {
+        event: "resource_delivery_failed",
+        resourceId: resource.id,
+        paymentId: payment.id,
+        payerAddress,
+        storagePath: resource.storagePath,
+        err,
+      },
+      "file download failed after payment; payment marked undelivered for reconciliation",
+    );
+    throw new AppError("UPSTREAM_ERROR", "Failed to deliver resource content", {
+      paymentId: payment.id,
+      deliveryStatus: "undelivered",
+    });
+  }
+
+  const payment = await recordPayment("delivered");
+  emitPurchase(payment);
+
   // Add receipt info in headers for file downloads
   res.setHeader("X-Payment-Id", payment.id);
   res.setHeader("X-Payment-Amount", `${payment.amount} USDC`);
   res.setHeader("X-Payment-Recipient", payment.recipientAddress);
 
-  const { buffer, mimeType } = await downloadFile(resource.storagePath);
+  const { buffer, mimeType } = fileContent;
   res.setHeader("Content-Type", mimeType);
   res.setHeader(
     "Content-Disposition",
